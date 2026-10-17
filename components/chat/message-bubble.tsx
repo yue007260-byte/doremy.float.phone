@@ -21,7 +21,7 @@ import remarkGfm from "remark-gfm";
 import remarkCjkFriendly from "remark-cjk-friendly";
 import remarkBreaks from "remark-breaks";
 import { createPortal } from "react-dom";
-import { Blocks, Maximize2, ReceiptText } from "lucide-react";
+import { Blocks, Maximize2, ReceiptText, Play, Pause, RotateCw, Loader2 } from "lucide-react";
 import { retryChatGeneratedImage } from "@/lib/generated-image-retry";
 import { hasCharacterReferenceImage } from "@/lib/image-generation-service";
 import { GeneratedImageErrorDialog } from "./generated-image-error-dialog";
@@ -135,6 +135,16 @@ export const MessageBubble = memo(function MessageBubble({ msg, onUpdate, charNa
             return (
                 <>
                     {textBubble}
+                    {msg.role !== "user" && characterId && (displayContent ?? msg.content) ? (
+                        <div className="flex justify-end mt-1.5 select-none" onClick={(e) => e.stopPropagation()}>
+                            <MessageVoicePillControl
+                                msg={msg}
+                                characterId={characterId}
+                                text={displayContent ?? msg.content}
+                                onUpdate={onUpdate}
+                            />
+                        </div>
+                    ) : null}
                     <ChatPluginSlot name="message.footer" slotProps={{ sessionId: msg.sessionId, message: msg }} className="chat-plugin-message-footer" />
                 </>
             );
@@ -2349,6 +2359,152 @@ function synthesizeVoiceForMessage(msgId: string, characterId: string, speechTex
     _voiceSynthInFlight.set(msgId, task);
     task.catch(() => {}).then(() => { _voiceSynthInFlight.delete(msgId); });
     return task;
+}
+
+function MessageVoicePillControl({
+    msg,
+    characterId,
+    text,
+    onUpdate,
+}: {
+    msg: ChatMessage;
+    characterId: string;
+    text: string;
+    onUpdate?: (m: ChatMessage) => void;
+}) {
+    const [playing, setPlaying] = useState(false);
+    const [synthesizing, setSynthesizing] = useState(false);
+    const audioRef = useRef<HTMLAudioElement | null>(null);
+    const mountedRef = useRef(true);
+
+    useEffect(() => {
+        mountedRef.current = true;
+        return () => {
+            mountedRef.current = false;
+            if (audioRef.current) {
+                try {
+                    audioRef.current.pause();
+                    audioRef.current.removeAttribute("src");
+                    audioRef.current.load();
+                } catch { /* ignore */ }
+                audioRef.current = null;
+            }
+        };
+    }, []);
+
+    const bilingual = splitBilingualText(text);
+    const speechText = normalizeTextBubbleContent(bilingual?.original || text);
+
+    const playSrc = (src: string) => {
+        if (audioRef.current) {
+            try {
+                audioRef.current.pause();
+                audioRef.current.removeAttribute("src");
+                audioRef.current.load();
+            } catch { /* ignore */ }
+            audioRef.current = null;
+        }
+        const audio = new Audio(src);
+        audioRef.current = audio;
+        setPlaying(true);
+        const finalize = () => {
+            if (audioRef.current === audio) audioRef.current = null;
+            try { audio.pause(); audio.removeAttribute("src"); audio.load(); } catch { /* ignore */ }
+            setPlaying(false);
+        };
+        audio.onended = finalize;
+        audio.onerror = finalize;
+        audio.play().catch(finalize);
+    };
+
+    const handlePlayOrPause = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (synthesizing) return;
+        if (playing && audioRef.current) {
+            const active = audioRef.current;
+            audioRef.current = null;
+            try { active.pause(); active.removeAttribute("src"); active.load(); } catch { /* ignore */ }
+            setPlaying(false);
+            return;
+        }
+        if (msg.mediaUrl && msg.mediaData?.synthesizedFromText === speechText) {
+            playSrc(msg.mediaUrl);
+            return;
+        }
+        setSynthesizing(true);
+        synthesizeVoiceForMessage(msg.id, characterId, speechText)
+            .then((dataUrl) => {
+                if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText } });
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+                playSrc(dataUrl);
+            })
+            .catch(() => {
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+            });
+    };
+
+    const handleRegenerate = (e: React.MouseEvent) => {
+        e.stopPropagation();
+        if (synthesizing) return;
+        if (audioRef.current) {
+            try {
+                audioRef.current.pause();
+                audioRef.current.removeAttribute("src");
+                audioRef.current.load();
+            } catch { /* ignore */ }
+            audioRef.current = null;
+        }
+        setPlaying(false);
+        setSynthesizing(true);
+        synthesizeVoiceForMessage(msg.id, characterId, speechText)
+            .then((dataUrl) => {
+                if (onUpdate) onUpdate({ ...msg, mediaUrl: dataUrl, mediaData: { ...msg.mediaData, synthesizedFromText: speechText } });
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+                playSrc(dataUrl);
+            })
+            .catch(() => {
+                if (!mountedRef.current) return;
+                setSynthesizing(false);
+            });
+    };
+
+    if (!speechText) return null;
+
+    return (
+        <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 border border-black/5 dark:border-white/10 text-neutral-600 dark:text-neutral-300 transition-colors shadow-sm">
+            <button
+                type="button"
+                onClick={handlePlayOrPause}
+                disabled={synthesizing}
+                title={playing ? "暂停" : "播放语音"}
+                className="flex items-center gap-1 hover:text-neutral-900 dark:hover:text-white transition-colors"
+            >
+                {synthesizing ? (
+                    <Loader2 size={12} className="animate-spin text-neutral-500" />
+                ) : playing ? (
+                    <Pause size={12} className="fill-current" />
+                ) : (
+                    <Play size={12} className="fill-current" />
+                )}
+                <span className="text-[11px] font-medium leading-none">
+                    {synthesizing ? "合成中" : playing ? "播放中" : "朗读"}
+                </span>
+            </button>
+            <span className="w-[1px] h-2.5 bg-black/10 dark:bg-white/15" />
+            <button
+                type="button"
+                onClick={handleRegenerate}
+                disabled={synthesizing}
+                title="重新生成语音"
+                className="hover:text-neutral-900 dark:hover:text-white transition-colors flex items-center justify-center p-0.5"
+            >
+                <RotateCw size={11} className={synthesizing ? "animate-spin opacity-50" : ""} />
+            </button>
+        </div>
+    );
 }
 
 function VoiceMessageBubble({ msg, characterId, onUpdate, defaultTranslationExpanded = false }: { msg: ChatMessage; characterId?: string; onUpdate?: (m: ChatMessage) => void; defaultTranslationExpanded?: boolean }) {
