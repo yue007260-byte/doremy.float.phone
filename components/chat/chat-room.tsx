@@ -53,7 +53,7 @@ import { useKeyboardDismissAutoSend } from "@/components/chat/use-keyboard-dismi
 import { cancelBailoutKey } from "@/lib/push-bailout-client";
 import { PENDING_REPLY_PREFIX } from "@/lib/friend-request-engine";
 import type { UserIdentity } from "@/components/settings/user-identity";
-import { AlertCircle, Blocks, Check, Trash2, User, ChevronLeft, ChevronRight, Clapperboard, Clock, Gift, Languages, Loader2, MoreHorizontal, X } from "lucide-react";
+import { AlertCircle, Blocks, Check, Trash2, User, ChevronLeft, ChevronRight, Clapperboard, Clock, Gift, Languages, Loader2, MoreHorizontal, X, Headphones, Play, Pause, SkipForward, SkipBack } from "lucide-react";
 import { setDebugChatState } from "@/lib/debug-store";
 import { SessionCustomCSS } from "@/components/ui/session-custom-css";
 import { setChatActive } from "@/lib/music-action-queue";
@@ -1393,6 +1393,13 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     };
     const [voiceTextIds, setVoiceTextIds] = useState<Set<string>>(new Set());
+    // 连续朗读状态
+    const [autoTtsActive, setAutoTtsActive] = useState(false);
+    const [autoTtsPlaying, setAutoTtsPlaying] = useState(false);
+    const [autoTtsCurrentIndex, setAutoTtsCurrentIndex] = useState(0);
+    const [autoTtsBuffering, setAutoTtsBuffering] = useState(false);
+    const autoTtsAudioRef = useRef<HTMLAudioElement | null>(null);
+    const autoTtsTargetListRef = useRef<{ id: string; characterId: string; text: string }[]>([]);
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editingContent, setEditingContent] = useState("");
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
@@ -1782,6 +1789,149 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             return [part];
         }).filter(part => part.mediaType || part.content.trim());
     }, [character?.name, userIdentity?.name]);
+
+    // 连续朗读停止与清理
+    const stopAutoTts = useCallback(() => {
+        if (autoTtsAudioRef.current) {
+            try {
+                autoTtsAudioRef.current.pause();
+                autoTtsAudioRef.current.removeAttribute("src");
+                autoTtsAudioRef.current.load();
+            } catch { /* ignore */ }
+            autoTtsAudioRef.current = null;
+        }
+        setAutoTtsActive(false);
+        setAutoTtsPlaying(false);
+        setAutoTtsBuffering(false);
+        setHighlightMessageId(null);
+    }, []);
+
+    // 播放指定索引处的语音
+    const playAutoTtsItem = useCallback(async (index: number) => {
+        const list = autoTtsTargetListRef.current;
+        if (index < 0 || index >= list.length) {
+            stopAutoTts();
+            return;
+        }
+
+        const target = list[index];
+        setAutoTtsCurrentIndex(index);
+        setHighlightMessageId(target.id);
+
+        // 视口平滑滚动到当前消息
+        const el = document.getElementById(`message-${target.id}`);
+        if (el) {
+            el.scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+
+        if (autoTtsAudioRef.current) {
+            try {
+                autoTtsAudioRef.current.pause();
+                autoTtsAudioRef.current.removeAttribute("src");
+                autoTtsAudioRef.current.load();
+            } catch { /* ignore */ }
+            autoTtsAudioRef.current = null;
+        }
+
+        setAutoTtsBuffering(true);
+        setAutoTtsPlaying(false);
+
+        try {
+            const { persistMessageVoiceAudio } = await import("@/lib/chat-storage");
+            const allMsgs = loadChatMessages(session.id);
+            const currentMsg = allMsgs.find(m => m.id === target.id);
+            let audioSrc = currentMsg?.mediaUrl;
+
+            if (!audioSrc || currentMsg?.mediaData?.synthesizedFromText !== target.text) {
+                const { resolveVoiceConfig, synthesizeSpeech } = await import("@/lib/tts-service");
+                const vc = resolveVoiceConfig(target.characterId);
+                if (!vc) throw new Error("未绑定语音配置");
+                const blob = await synthesizeSpeech(target.text, vc);
+                if (!blob) throw new Error("合成失败");
+                audioSrc = await new Promise<string>((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result as string);
+                    reader.onerror = () => reject(new Error("音频编码失败"));
+                    reader.readAsDataURL(blob);
+                });
+                await persistMessageVoiceAudio(target.id, audioSrc, target.text);
+            }
+
+            if (!mountedRef.current) return;
+            setAutoTtsBuffering(false);
+
+            const audio = new Audio(audioSrc);
+            autoTtsAudioRef.current = audio;
+            setAutoTtsPlaying(true);
+
+            audio.onended = () => {
+                if (autoTtsAudioRef.current === audio) {
+                    playAutoTtsItem(index + 1);
+                }
+            };
+            audio.onerror = () => {
+                if (autoTtsAudioRef.current === audio) {
+                    // 出错时自动跳下一句
+                    playAutoTtsItem(index + 1);
+                }
+            };
+
+            await audio.play();
+        } catch (err: any) {
+            if (!mountedRef.current) return;
+            setAutoTtsBuffering(false);
+            showChatToast(`朗读失败: ${err?.message || String(err)}`);
+            stopAutoTts();
+        }
+    }, [session.id, stopAutoTts]);
+
+    // 开始连续朗读
+    const startAutoTts = useCallback(() => {
+        const allMsgs = loadChatMessages(session.id);
+        const candidates: { id: string; characterId: string; text: string }[] = [];
+
+        for (const m of allMsgs) {
+            if (m.role !== "user" && m.mediaType !== "poke" && m.mediaType !== "group_admin_notice" && !m.isRetracted) {
+                const charId = m.senderCharacterId || session.contactId;
+                const text = (m.content || "").replace(/\[[^\]]+\]/g, "").trim();
+                if (text && charId) {
+                    candidates.push({ id: m.id, characterId: charId, text });
+                }
+            }
+        }
+
+        if (candidates.length === 0) {
+            showChatToast("没有找到可朗读的角色消息");
+            return;
+        }
+
+        autoTtsTargetListRef.current = candidates;
+        setAutoTtsActive(true);
+        playAutoTtsItem(0);
+    }, [session.id, session.contactId, playAutoTtsItem]);
+
+    const toggleAutoTtsPlayPause = useCallback(() => {
+        if (!autoTtsAudioRef.current) return;
+        if (autoTtsPlaying) {
+            autoTtsAudioRef.current.pause();
+            setAutoTtsPlaying(false);
+        } else {
+            autoTtsAudioRef.current.play().then(() => setAutoTtsPlaying(true)).catch(() => {});
+        }
+    }, [autoTtsPlaying]);
+
+    useEffect(() => {
+        return () => {
+            if (autoTtsAudioRef.current) {
+                try {
+                    autoTtsAudioRef.current.pause();
+                    autoTtsAudioRef.current.removeAttribute("src");
+                    autoTtsAudioRef.current.load();
+                } catch { /* ignore */ }
+                autoTtsAudioRef.current = null;
+            }
+        };
+    }, []);
 
     useEffect(() => {
         const refreshRegexes = () => setRegexRevision(value => value + 1);
@@ -5853,7 +6003,16 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                             </span>
                         )}
                     </span>
-                    <span className="page-header-right">
+                    <span className="page-header-right flex items-center gap-1">
+                        <button
+                            className={`page-back-btn flex items-center justify-center ${autoTtsActive ? "text-blue-500" : ""}`}
+                            type="button"
+                            onClick={autoTtsActive ? stopAutoTts : startAutoTts}
+                            title={autoTtsActive ? "停止连续朗读" : "连续朗读"}
+                            aria-label={autoTtsActive ? "停止连续朗读" : "连续朗读"}
+                        >
+                            <Headphones size={20} strokeWidth={1.5} />
+                        </button>
                         <button className="page-back-btn" type="button" onClick={() => setShowSettings(true)} aria-label="更多">
                             <MoreHorizontal size={22} strokeWidth={1.5} />
                         </button>
@@ -5865,6 +6024,63 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 slotProps={{ sessionId: session.id, isGroup: !!session.isGroup }}
                 className="chat-plugin-header chat-room-main-pane"
             />
+
+            {/* 连续朗读悬浮控制胶囊 */}
+            {autoTtsActive && (
+                <div className="z-30 px-3 py-1.5 flex items-center justify-between bg-white/80 dark:bg-neutral-900/80 backdrop-blur-md border-b border-black/5 dark:border-white/10 shadow-sm text-xs">
+                    <div className="flex items-center gap-2 min-w-0">
+                        <span className="flex items-center gap-1 font-medium text-neutral-800 dark:text-neutral-200">
+                            {autoTtsBuffering ? (
+                                <Loader2 size={13} className="animate-spin text-blue-500" />
+                            ) : (
+                                <Headphones size={13} className="text-blue-500" />
+                            )}
+                            <span>朗读中 ({autoTtsCurrentIndex + 1}/{autoTtsTargetListRef.current.length})</span>
+                        </span>
+                        {autoTtsBuffering && (
+                            <span className="text-[10px] text-neutral-400">合成中...</span>
+                        )}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                        <button
+                            type="button"
+                            onClick={() => playAutoTtsItem(Math.max(0, autoTtsCurrentIndex - 1))}
+                            disabled={autoTtsCurrentIndex <= 0}
+                            className="p-1 hover:text-blue-500 disabled:opacity-30 transition-colors"
+                            title="上一句"
+                        >
+                            <SkipBack size={14} />
+                        </button>
+                        <button
+                            type="button"
+                            onClick={toggleAutoTtsPlayPause}
+                            disabled={autoTtsBuffering}
+                            className="p-1 hover:text-blue-500 transition-colors"
+                            title={autoTtsPlaying ? "暂停" : "播放"}
+                        >
+                            {autoTtsPlaying ? <Pause size={14} className="fill-current" /> : <Play size={14} className="fill-current" />}
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => playAutoTtsItem(autoTtsCurrentIndex + 1)}
+                            disabled={autoTtsCurrentIndex >= autoTtsTargetListRef.current.length - 1}
+                            className="p-1 hover:text-blue-500 disabled:opacity-30 transition-colors"
+                            title="下一句"
+                        >
+                            <SkipForward size={14} />
+                        </button>
+                        <span className="w-[1px] h-3 bg-black/10 dark:bg-white/10 mx-0.5" />
+                        <button
+                            type="button"
+                            onClick={stopAutoTts}
+                            className="p-1 hover:text-red-500 transition-colors"
+                            title="退出朗读"
+                        >
+                            <X size={14} />
+                        </button>
+                    </div>
+                </div>
+            )}
 
             {/* Message List */}
             <div
