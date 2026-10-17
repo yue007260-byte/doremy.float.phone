@@ -2439,9 +2439,11 @@ function MessageVoicePillControl({
                 setSynthesizing(false);
                 playSrc(dataUrl);
             })
-            .catch(() => {
+            .catch((err) => {
                 if (!mountedRef.current) return;
                 setSynthesizing(false);
+                const errMsg = err?.message || String(err);
+                alert(`语音合成失败: ${errMsg}`);
             });
     };
 
@@ -2465,18 +2467,26 @@ function MessageVoicePillControl({
                 setSynthesizing(false);
                 playSrc(dataUrl);
             })
-            .catch(() => {
+            .catch((err) => {
                 if (!mountedRef.current) return;
                 setSynthesizing(false);
+                const errMsg = err?.message || String(err);
+                alert(`语音合成失败: ${errMsg}`);
             });
     };
 
     if (!speechText) return null;
 
     return (
-        <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 border border-black/5 dark:border-white/10 text-neutral-600 dark:text-neutral-300 transition-colors shadow-sm">
+        <div
+            className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs bg-black/5 dark:bg-white/10 hover:bg-black/10 dark:hover:bg-white/15 border border-black/5 dark:border-white/10 text-neutral-600 dark:text-neutral-300 transition-colors shadow-sm"
+            onPointerDown={(e) => e.stopPropagation()}
+            onPointerUp={(e) => e.stopPropagation()}
+            onClick={(e) => e.stopPropagation()}
+        >
             <button
                 type="button"
+                onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
                 onClick={handlePlayOrPause}
                 disabled={synthesizing}
                 title={playing ? "暂停" : "播放语音"}
@@ -2496,6 +2506,7 @@ function MessageVoicePillControl({
             <span className="w-[1px] h-2.5 bg-black/10 dark:bg-white/15" />
             <button
                 type="button"
+                onPointerDown={(e) => { e.stopPropagation(); e.preventDefault(); }}
                 onClick={handleRegenerate}
                 disabled={synthesizing}
                 title="重新生成语音"
