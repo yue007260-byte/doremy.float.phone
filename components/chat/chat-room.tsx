@@ -1407,9 +1407,12 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const autoTtsTargetListRef = useRef<{ id: string; characterId: string; text: string }[]>([]);
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editingContent, setEditingContent] = useState("");
-    // 导演模式：正在被指导的那条角色回复
-    const [directorTarget, setDirectorTarget] = useState<ChatMessage | null>(null);
+    // 导演模式：正在被指导的角色回复（支持多选）
+    const [directorTargets, setDirectorTargets] = useState<ChatMessage[]>([]);
     const [directorBusy, setDirectorBusy] = useState(false);
+    // 导演模式多选：选中后点确认才打开对话框
+    const [isDirectorSelectMode, setIsDirectorSelectMode] = useState(false);
+    const [directorSelectedIds, setDirectorSelectedIds] = useState<Set<string>>(new Set());
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
     const [editingResponseRoundId, setEditingResponseRoundId] = useState<string | null>(null);
     const [editingResponseContent, setEditingResponseContent] = useState("");
@@ -1437,7 +1440,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     useChatBottomReserve(
         wrapperRef,
         scrollRef,
-        `${session.id}:${offlineMode}:${isMultiSelectMode}:${showEmojiPanel}:${showStickerPanel}:${showPlusMenu}:${theaterMode}:${!!quotingMessage}`,
+        `${session.id}:${offlineMode}:${isMultiSelectMode}:${isDirectorSelectMode}:${showEmojiPanel}:${showStickerPanel}:${showPlusMenu}:${theaterMode}:${!!quotingMessage}`,
     );
 
     const selectStoredMessageWindow = useCallback((allMsgs: ChatMessage[]) => {
@@ -4194,7 +4197,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     // 收起键盘（或关掉表情/加号面板）并安静 N 秒后自动触发回复，
     // 等价于替用户点一次「触发回复」。判定全在 hook 内部，配置关掉后与手动模式一致。
     useKeyboardDismissAutoSend(wrapperRef, {
-        active: !offlineMode && !isMultiSelectMode,
+        active: !offlineMode && !isMultiSelectMode && !isDirectorSelectMode,
         pending: pendingGenerate,
         generating: isGenerating,
         panelOpen: showEmojiPanel || showStickerPanel || showPlusMenu,
@@ -4764,13 +4767,20 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     };
 
     const handleDirectorMode = useCallback((messageId: string) => {
+        // messageId 来自 getStoredActionMessageId，已是存储层的真实 id
         const msg = messages.find(m => m.id === messageId);
         if (!msg || msg.role !== "assistant") return;
-        setDirectorTarget(msg);
+        // 进入导演多选模式，预选当前这条
+        closeContextMenu();
+        setShowEmojiPanel(false);
+        setShowStickerPanel(false);
+        setShowPlusMenu(false);
+        setIsDirectorSelectMode(true);
+        setDirectorSelectedIds(new Set([messageId]));
     }, [messages]);
 
     const handleDirectorSubmit = useCallback(async (draft: DirectorDraft, saveAsRule: boolean) => {
-        if (!directorTarget || directorBusy) return;
+        if (directorTargets.length === 0 || directorBusy) return;
         
         setDirectorBusy(true);
         try {
@@ -4779,20 +4789,24 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 await saveDirectorRule(session.contactId, draft);
             }
 
-            // 构建一次性重写指令
-            const retryNote = buildDirectorRetryNote(draft, directorTarget.content);
+            // 构建一次性重写指令（多条消息的内容）
+            const originalContents = directorTargets.map(m => m.content);
+            const retryNote = buildDirectorRetryNote(draft, originalContents);
 
-            // 截断到该条消息之前的历史
-            const idx = messages.findIndex(m => m.id === directorTarget.id);
-            if (idx < 0) return;
-            const historyUpToRegenPoint = messages.slice(0, idx);
+            // 找到最早的那条消息，从它开始截断
+            const indices = directorTargets
+                .map(m => messages.findIndex(msg => msg.id === m.id))
+                .filter(i => i >= 0);
+            if (indices.length === 0) return;
+            const earliestIdx = Math.min(...indices);
+            const historyUpToRegenPoint = messages.slice(0, earliestIdx);
             
-            // 删除该条消息及之后的所有内容
-            deleteChatMessagesFrom(directorTarget.id);
+            // 删除最早那条消息及之后的所有内容
+            deleteChatMessagesFrom(messages[earliestIdx].id);
             setMessages(historyUpToRegenPoint);
 
             // 关闭对话框
-            setDirectorTarget(null);
+            setDirectorTargets([]);
 
             // 带着指导重新生成
             await runManagedGeneration({ 
@@ -4802,11 +4816,43 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         } finally {
             setDirectorBusy(false);
         }
-    }, [directorTarget, directorBusy, messages, session, runManagedGeneration]);
+    }, [directorTargets, directorBusy, messages, session, runManagedGeneration]);
 
     const handleDirectorCancel = useCallback(() => {
-        setDirectorTarget(null);
+        setDirectorTargets([]);
     }, []);
+
+    const cancelDirectorSelect = useCallback(() => {
+        setIsDirectorSelectMode(false);
+        setDirectorSelectedIds(new Set());
+    }, []);
+
+    const toggleDirectorSelectedMessage = useCallback((messageId: string) => {
+        setDirectorSelectedIds(prev => {
+            const next = new Set(prev);
+            if (next.has(messageId)) next.delete(messageId);
+            else next.add(messageId);
+            return next;
+        });
+    }, []);
+
+    const confirmDirectorSelection = useCallback(() => {
+        // directorSelectedIds 里存的是 storedMessageId（已经过 getSelectableStoredMessageId 解析），
+        // 直接按 id 匹配 messages（ChatMessage[]）即可；找不到时回退到存储层
+        let selected = messages.filter(m =>
+            m.role === "assistant" && directorSelectedIds.has(m.id)
+        );
+        if (selected.length === 0) {
+            const allMsgs = loadChatMessages(session.id);
+            selected = allMsgs.filter(m =>
+                m.role === "assistant" && directorSelectedIds.has(m.id)
+            );
+        }
+        if (selected.length === 0) return;
+        setIsDirectorSelectMode(false);
+        setDirectorSelectedIds(new Set());
+        setDirectorTargets(selected);
+    }, [messages, directorSelectedIds, session.id]);
 
     const handleRetractMessage = (msgId: string) => {
         retractChatMessage(msgId);
@@ -6522,6 +6568,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     const selectableStoredId = getSelectableStoredMessageId(msg);
                     const isMultiSelectable = isMultiSelectMode && !!selectableStoredId && !hiddenEmpty;
                     const isMultiSelected = !!selectableStoredId && selectedMessageIds.has(selectableStoredId);
+                    // 导演多选：只有 assistant 消息可选
+                    const isDirectorSelectable = isDirectorSelectMode && !!selectableStoredId && !hiddenEmpty && msg.role === "assistant";
+                    const isDirectorSelected = !!selectableStoredId && directorSelectedIds.has(selectableStoredId);
                     const blacklistEvent = msg.mediaData?.blacklistEvent;
                     const isBlacklistEventExpanded = Boolean(blacklistEvent && expandedBlacklistEventIds.has(msg.id));
                     const multiSelectWrapperProps = isMultiSelectable ? {
@@ -6532,6 +6581,14 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         },
                         "data-multi-select": "",
                         ...(isMultiSelected ? { "data-selected": "" } : {}),
+                    } : isDirectorSelectable ? {
+                        onClickCapture: (e: React.MouseEvent) => {
+                            e.preventDefault();
+                            e.stopPropagation();
+                            toggleDirectorSelectedMessage(selectableStoredId!);
+                        },
+                        "data-multi-select": "",
+                        ...(isDirectorSelected ? { "data-selected": "" } : {}),
                     } : {};
 
                     return (
@@ -6572,6 +6629,11 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                 {isMultiSelectable && (
                                     <span className="chat-multi-select-check" aria-hidden="true">
                                         {isMultiSelected && <Check size={14} strokeWidth={2.5} />}
+                                    </span>
+                                )}
+                                {isDirectorSelectable && (
+                                    <span className="chat-multi-select-check" aria-hidden="true" style={{ color: "var(--c-accent)" }}>
+                                        {isDirectorSelected && <Clapperboard size={14} strokeWidth={2.5} />}
                                     </span>
                                 )}
                                 {uiRole(msg) === "system" ? (
@@ -6974,7 +7036,34 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     </button>
                 </div>
             )}
-            {!isMultiSelectMode && (offlineMode ? (
+            {isDirectorSelectMode && !offlineMode && (
+                <div className="chat-multi-select-bar chat-room-main-pane" data-ui="director-select">
+                    <button
+                        type="button"
+                        className="chat-multi-select-icon-btn"
+                        onClick={cancelDirectorSelect}
+                        aria-label="退出导演选择"
+                        title="退出导演选择"
+                    >
+                        <X size={20} strokeWidth={1.8} />
+                    </button>
+                    <div className="chat-multi-select-summary">
+                        <strong>导演模式：已选 {directorSelectedIds.size} 条</strong>
+                        <span>点击角色回复选中/取消，然后确认</span>
+                    </div>
+                    <button
+                        type="button"
+                        className="chat-multi-select-delete-btn"
+                        disabled={directorSelectedIds.size === 0}
+                        onClick={confirmDirectorSelection}
+                        style={{ background: "var(--c-accent)", color: "#fff" }}
+                    >
+                        <Clapperboard size={18} strokeWidth={1.8} />
+                        确认
+                    </button>
+                </div>
+            )}
+            {!isMultiSelectMode && !isDirectorSelectMode && (offlineMode ? (
                 <OfflineTextInputBar
                     key={session.id}
                     ref={offlineTextInputRef}
@@ -7479,9 +7568,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 />
             )}
 
-            {directorTarget && (
+            {directorTargets.length > 0 && (
                 <DirectorModeDialog
-                    message={directorTarget}
+                    messages={directorTargets}
                     characterName={character?.name || "对方"}
                     busy={directorBusy}
                     onSubmit={handleDirectorSubmit}

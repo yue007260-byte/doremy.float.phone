@@ -103,9 +103,16 @@ export async function deleteDirectorRule(ruleId: string): Promise<void> {
 
 /**
  * 构建一次性重生成指令（本次指导，不进入长期记忆）
+ * 支持单条或多条消息的导演指导。
  */
-export function buildDirectorRetryNote(draft: DirectorDraft, originalContent: string): string {
-    return `【导演指导】刚才这条回复不符合角色设定，请按以下指导重新生成：
+export function buildDirectorRetryNote(draft: DirectorDraft, originalContents: string | string[]): string {
+    const contents = Array.isArray(originalContents) ? originalContents : [originalContents];
+    const contentSection = contents.length === 1
+        ? `原始回复：${contents[0]}`
+        : contents.map((c, i) => `原始回复 ${i + 1}：${c}`).join("\n");
+    return `【导演指导】以下回复不符合角色设定，请按指导重新生成：
+
+${contentSection}
 
 问题所在：${draft.issues}
 问题原因：${draft.reason}

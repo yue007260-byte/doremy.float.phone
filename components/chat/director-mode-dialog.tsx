@@ -5,14 +5,14 @@ import type { ChatMessage } from "@/lib/chat-storage";
 import type { DirectorDraft } from "@/lib/chat-director";
 
 interface DirectorModeDialogProps {
-    message: ChatMessage;
+    messages: ChatMessage[];
     characterName: string;
     busy: boolean;
     onSubmit: (draft: DirectorDraft, saveAsRule: boolean) => void;
     onCancel: () => void;
 }
 
-export function DirectorModeDialog({ message, characterName, busy, onSubmit, onCancel }: DirectorModeDialogProps) {
+export function DirectorModeDialog({ messages, characterName, busy, onSubmit, onCancel }: DirectorModeDialogProps) {
     const [issues, setIssues] = useState("");
     const [reason, setReason] = useState("");
     const [example, setExample] = useState("");
@@ -25,6 +25,8 @@ export function DirectorModeDialog({ message, characterName, busy, onSubmit, onC
         onSubmit({ issues: issues.trim(), reason: reason.trim(), example: example.trim() }, saveAsRule);
     };
 
+    const isSingle = messages.length === 1;
+
     return (
         <div className="chat-html-overlay" onClick={onCancel}>
             <div
@@ -34,7 +36,11 @@ export function DirectorModeDialog({ message, characterName, busy, onSubmit, onC
                 <div className="flex items-center justify-between gap-3">
                     <div className="flex flex-col gap-1">
                         <span className="menu-label">导演模式</span>
-                        <span className="menu-desc !mt-0">指出这条回复不符合角色的地方，AI 会按你的指导重新生成</span>
+                        <span className="menu-desc !mt-0">
+                            {isSingle
+                                ? "指出这条回复不符合角色的地方，AI 会按你的指导重新生成"
+                                : `已选中 ${messages.length} 条回复，指出它们的问题，AI 会从最早那条开始重新生成`}
+                        </span>
                     </div>
                     <button
                         onClick={onCancel}
@@ -46,9 +52,23 @@ export function DirectorModeDialog({ message, characterName, busy, onSubmit, onC
 
                 {/* 原始回复预览 */}
                 <div className="flex flex-col gap-2">
-                    <span className="ts-13 text-[var(--c-text-secondary)]">{characterName} 的原始回复：</span>
-                    <div className="rounded-2xl bg-[var(--c-surface-2)] px-4 py-3 ts-14 text-[var(--c-text)] max-h-[120px] overflow-y-auto">
-                        {message.content || "(空消息)"}
+                    <span className="ts-13 text-[var(--c-text-secondary)]">
+                        {isSingle
+                            ? `${characterName} 的原始回复：`
+                            : `${characterName} 的 ${messages.length} 条原始回复：`}
+                    </span>
+                    <div className={`flex flex-col gap-2 ${!isSingle ? "max-h-[180px] overflow-y-auto" : ""}`}>
+                        {messages.map((message, idx) => (
+                            <div
+                                key={message.id}
+                                className="rounded-2xl bg-[var(--c-surface-2)] px-4 py-3 ts-14 text-[var(--c-text)] max-h-[120px] overflow-y-auto"
+                            >
+                                {!isSingle && (
+                                    <span className="ts-12 text-[var(--c-text-tertiary)] mr-1">#{idx + 1}</span>
+                                )}
+                                {message.content || "(空消息)"}
+                            </div>
+                        ))}
                     </div>
                 </div>
 
