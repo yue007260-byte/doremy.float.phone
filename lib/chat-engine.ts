@@ -60,6 +60,7 @@ import { setDebugPromptSnapshot, type DebugPromptSnapshot } from "./debug-store"
 import { extractFinishReason } from "./api-helpers";
 import { fetchLlmPayload } from "./llm-http";
 import { loadMemoryConfig, incrementEventCounter } from "./memory-storage";
+import { buildDirectorRulesPrompt, loadDirectorRules } from "./chat-director";
 import { retrieveCoreMemoriesForPrompt, retrieveMemoriesForPrompt } from "./memory-service";
 import { formatCoreMemories, formatLongTermMemories } from "./memory-injector";
 import { maybeRunSummarization } from "./memory-summarizer";
@@ -2028,6 +2029,16 @@ export async function buildChatPromptMessages(
             content: "本次自定义 APP AI 任务只输出严格 JSON。不要输出 Markdown 代码块、解释文字或聊天富媒体指令。",
         });
     }
+    // ── 导演模式：长期表演要求 ──
+    // 用户以「导演」身份纠正过的说话方式，作为人设约束长期生效。
+    // 只注入私聊（群聊里同一角色的表现由群聊链路另行处理），且离线/自定义 APP 场景不掺入。
+    if (!session.isGroup && resolvedAppId === "chat") {
+        const directorRulesPrompt = buildDirectorRulesPrompt(await loadDirectorRules(character.id));
+        if (directorRulesPrompt) {
+            llmMessages.push({ role: "system", content: directorRulesPrompt });
+        }
+    }
+
     appendEmptyGenerateGuardMessage(llmMessages, config, historyForPrompt);
 
     // ── 感知状态注入（默认关）──

@@ -36,6 +36,9 @@ import { CustomAppRunner } from "@/components/app-market/custom-app-runner";
 import { CustomAppForegroundBoundary } from "@/components/app-market/custom-app-failure";
 
 import { ChatSettingsPanel } from "./chat-settings-panel";
+import { DirectorModeDialog } from "./director-mode-dialog";
+import { buildDirectorRetryNote, saveDirectorRule } from "@/lib/chat-director";
+import type { DirectorDraft } from "@/lib/chat-director";
 // 通话界面不再由聊天室渲染：已提升到 desktop-shell 的 CallLayer，
 // 这样切会话、回桌面、开别的 App 都不会中断通话。聊天室只负责「发起」；
 // 挂断后的界面刷新由 chat-call-ended 事件回调，角色回应由全局层统一触发。
@@ -321,6 +324,8 @@ type ManagedGenerationOptions = {
     history: ChatMessage[];
     errorPrefix?: string;
     onDecline?: () => void | Promise<void>;
+    /** 只随本次请求送出的系统提示（导演模式重写指令等）：不落库、不进历史 */
+    systemNote?: string;
 };
 
 const activeGenerationRuns = new Map<string, ActiveGenerationRun>();
@@ -1402,6 +1407,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     const autoTtsTargetListRef = useRef<{ id: string; characterId: string; text: string }[]>([]);
     const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
     const [editingContent, setEditingContent] = useState("");
+    // 导演模式：正在被指导的那条角色回复
+    const [directorTarget, setDirectorTarget] = useState<ChatMessage | null>(null);
+    const [directorBusy, setDirectorBusy] = useState(false);
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
     const [editingResponseRoundId, setEditingResponseRoundId] = useState<string | null>(null);
     const [editingResponseContent, setEditingResponseContent] = useState("");
@@ -3493,6 +3501,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         history,
         errorPrefix = "发送失败",
         onDecline,
+        systemNote,
     }: ManagedGenerationOptions) => {
         if (isGeneratingRef.current) {
             if (activeGenerationRuns.has(session.id)) return;
@@ -3552,6 +3561,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     {
                         signal: generationRun.controller.signal,
                         appTags: theaterMode ? ["group_chat"] : undefined,
+                        ephemeralSystemNote: systemNote,
                     },
                 );
                 if (!isCurrentGeneration()) return;
@@ -3564,6 +3574,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     {
                         appTags: theaterMode ? ["chat"] : ["chat", "text"],
                         signal: generationRun.controller.signal,
+                        ephemeralSystemNote: systemNote,
                     },
                     {
                         onReasoning: (t) => { capturedReasoning = t; },
@@ -4752,6 +4763,51 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         });
     };
 
+    const handleDirectorMode = useCallback((messageId: string) => {
+        const msg = messages.find(m => m.id === messageId);
+        if (!msg || msg.role !== "assistant") return;
+        setDirectorTarget(msg);
+    }, [messages]);
+
+    const handleDirectorSubmit = useCallback(async (draft: DirectorDraft, saveAsRule: boolean) => {
+        if (!directorTarget || directorBusy) return;
+        
+        setDirectorBusy(true);
+        try {
+            // 保存为长期规则（可选）
+            if (saveAsRule && !session.isGroup && session.contactId) {
+                await saveDirectorRule(session.contactId, draft);
+            }
+
+            // 构建一次性重写指令
+            const retryNote = buildDirectorRetryNote(draft, directorTarget.content);
+
+            // 截断到该条消息之前的历史
+            const idx = messages.findIndex(m => m.id === directorTarget.id);
+            if (idx < 0) return;
+            const historyUpToRegenPoint = messages.slice(0, idx);
+            
+            // 删除该条消息及之后的所有内容
+            deleteChatMessagesFrom(directorTarget.id);
+            setMessages(historyUpToRegenPoint);
+
+            // 关闭对话框
+            setDirectorTarget(null);
+
+            // 带着指导重新生成
+            await runManagedGeneration({ 
+                history: historyUpToRegenPoint,
+                systemNote: retryNote,
+            });
+        } finally {
+            setDirectorBusy(false);
+        }
+    }, [directorTarget, directorBusy, messages, session, runManagedGeneration]);
+
+    const handleDirectorCancel = useCallback(() => {
+        setDirectorTarget(null);
+    }, []);
+
     const handleRetractMessage = (msgId: string) => {
         retractChatMessage(msgId);
         setMessages(prev => prev.map(m => m.id === msgId ? { ...m, isRetracted: true } : m));
@@ -5325,7 +5381,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         <button onClick={() => handleRetractMessage(storedMessageId)} className="ctx-menu-btn">撤回消息</button>
                     )}
                     {m.role === "assistant" && (
-                        <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+                        <>
+                            <button onClick={() => { handleDirectorMode(storedMessageId); setActiveMessageId(null); }} className="ctx-menu-btn">导演模式</button>
+                            <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
+                        </>
                     )}
                     <button onClick={() => { toggleCallStartMarker(m); setActiveMessageId(null); }} className="ctx-menu-btn">
                         {m.mediaData?.callStartMarker ? "取消通话开头" : "设为通话开头"}
@@ -7417,6 +7476,16 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 <GeneratedImageErrorDialog
                     message={imageGenerationFailure}
                     onClose={() => setImageGenerationFailure(null)}
+                />
+            )}
+
+            {directorTarget && (
+                <DirectorModeDialog
+                    message={directorTarget}
+                    characterName={character?.name || "对方"}
+                    busy={directorBusy}
+                    onSubmit={handleDirectorSubmit}
+                    onCancel={handleDirectorCancel}
                 />
             )}
 
