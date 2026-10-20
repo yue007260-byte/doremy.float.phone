@@ -3,13 +3,16 @@
  * 并将指导内容记忆化以影响后续回复。
  */
 
+import { resolveAuxiliaryApiConfig } from "./settings-storage";
+import { simpleLLMCall } from "./api-helpers";
+
 export interface DirectorDraft {
-    /** 不符合人设的点 */
-    issues: string;
-    /** 不符合的原因 */
-    reason: string;
     /** 正确的说话方式示例 */
     example: string;
+    /** 为什么示例是对的、原来是错的 */
+    explanation: string;
+    /** AI 对示例的理解与分析（由 analyzeDirectorExample 生成） */
+    analysis?: string;
 }
 
 export interface DirectorRule extends DirectorDraft {
@@ -102,6 +105,65 @@ export async function deleteDirectorRule(ruleId: string): Promise<void> {
 }
 
 /**
+ * 调用 LLM 分析导演示例：AI 阅读原始回复和用户的示例/说明，输出理解与分析。
+ */
+export async function analyzeDirectorExample(opts: {
+    originalContents: string[];
+    example: string;
+    explanation: string;
+    characterName: string;
+    feedback?: string;
+    signal?: AbortSignal;
+}): Promise<{ content?: string; error?: string }> {
+    const apiConfig = resolveAuxiliaryApiConfig("reasoningTranslateApiConfigId");
+    if (!apiConfig) {
+        return { error: "请先在设置 → 绑定配置 → 辅助 API 中设置翻译/分析 API（或设置全局默认 API）" };
+    }
+
+    const originalSection = opts.originalContents.length === 1
+        ? `${opts.characterName}的原始回复：\n${opts.originalContents[0]}`
+        : opts.originalContents.map((c, i) => `${opts.characterName}的原始回复 ${i + 1}：\n${c}`).join("\n\n");
+
+    const feedbackSection = opts.feedback
+        ? `\n\n用户对上次分析的反馈：${opts.feedback}`
+        : "";
+
+    const prompt = [
+        "你是一位角色扮演的导演助手。用户认为角色的回复不符合人设，提供了一个正确的示例和说明。",
+        "请分析用户的示例，总结出具体的写作规则——角色应该怎么说话、什么语气、什么风格、哪些表达要避免、哪些表达要采用。",
+        "输出要求：",
+        "- 用简洁的条目式总结（不超过 5 条）",
+        "- 每条说清楚「应该」和「不应该」",
+        "- 不要复述原文和示例，只输出你提炼的规则",
+        "",
+        originalSection,
+        "",
+        `用户提供的正确示例：\n${opts.example}`,
+        "",
+        `用户的说明（为什么示例是对的而原来是错的）：\n${opts.explanation}`,
+        feedbackSection,
+    ].join("\n");
+
+    const controller = opts.signal ? null : new AbortController();
+    const timer = controller ? setTimeout(() => controller.abort(), 60_000) : null;
+    try {
+        const result = await simpleLLMCall(apiConfig, [
+            { role: "user", content: prompt },
+        ], { temperature: 0.3, signal: opts.signal ?? controller?.signal, label: "导演模式分析" });
+
+        if (!result.content?.trim()) {
+            return { error: result.error || "分析失败，请重试" };
+        }
+        return { content: result.content.trim() };
+    } catch (e) {
+        if (controller?.signal.aborted) return { error: "分析超时，请重试" };
+        return { error: e instanceof Error ? e.message : "分析失败，请重试" };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+/**
  * 构建一次性重生成指令（本次指导，不进入长期记忆）
  * 支持单条或多条消息的导演指导。
  */
@@ -110,13 +172,13 @@ export function buildDirectorRetryNote(draft: DirectorDraft, originalContents: s
     const contentSection = contents.length === 1
         ? `原始回复：${contents[0]}`
         : contents.map((c, i) => `原始回复 ${i + 1}：${c}`).join("\n");
+    const analysisSection = draft.analysis ? `\nAI 提炼的写作规则：\n${draft.analysis}` : "";
     return `【导演指导】以下回复不符合角色设定，请按指导重新生成：
 
 ${contentSection}
 
-问题所在：${draft.issues}
-问题原因：${draft.reason}
-正确示例：${draft.example}
+用户提供的正确示例：${draft.example}
+用户说明：${draft.explanation}${analysisSection}
 
 请根据上述指导重新组织回复，保持角色一贯的说话方式和性格特点。`;
 }
@@ -128,7 +190,7 @@ export function buildDirectorRulesPrompt(rules: DirectorRule[]): string {
     if (rules.length === 0) return "";
     
     const rulesText = rules.map((rule, idx) => 
-        `${idx + 1}. ${rule.issues}\n   原因：${rule.reason}\n   正确方式：${rule.example}`
+        `${idx + 1}. 正确示例：${rule.example}\n   说明：${rule.explanation}${rule.analysis ? `\n   规则：${rule.analysis}` : ""}`
     ).join("\n\n");
     
     return `\n\n【导演指导规则】以下是用户对你说话方式的具体指导，请在后续回复中严格遵守：\n\n${rulesText}`;
