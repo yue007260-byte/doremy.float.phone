@@ -3737,28 +3737,31 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
         cancelFollowUp(session.id);
 
+        // 接管模式：所有消息类型都以角色身份落库，能力对齐 AI 能发的一切
+        const asCharacter = isTakeoverMode && !session.isGroup;
+
         if (mediaType === "poke") {
-            const pokeSender = userIdentity?.name || "你";
-            const pokeTarget = mediaData?.pokeTarget || character?.name || "对方";
+            const pokeSender = asCharacter ? (character?.name || "对方") : (userIdentity?.name || "你");
+            const pokeTarget = asCharacter ? (userIdentity?.name || "你") : (mediaData?.pokeTarget || character?.name || "对方");
             const sysMsg = pushChatMessage({
                 sessionId: session.id,
-                role: "user",
+                role: asCharacter ? "assistant" : "user",
                 content: `${pokeSender} 拍了拍 ${pokeTarget}`,
                 mediaType: "poke",
                 mediaData: { pokeSender, pokeTarget },
+                ...(asCharacter ? { senderCharacterId: session.contactId, senderName: character?.name } : {}),
             });
             setMessages(prev => [...prev, sysMsg]);
-            setPendingGenerate(true);
+            if (asCharacter) {
+                takeoverSamplesRef.current.push(`${pokeSender} 拍了拍 ${pokeTarget}`);
+            } else {
+                setPendingGenerate(true);
+            }
             return true;
         }
 
         const walletDebit = debitOutgoingMoneyMessage(mediaType, mediaData);
         if (!walletDebit.ok) return false;
-
-        // 接管模式：语音/表情包/图片等「消息类」富媒体以角色身份落库，不触发角色回复。
-        // 资金类（红包/转账/代付/礼物）与拍一拍属于用户动作，保持用户身份。
-        const TAKEOVER_MESSAGE_TYPES: ChatMessage["mediaType"][] = ["sticker", "audio", "image", "location", "music_share", "xiaohongshu_note_share", "app_card"];
-        const asCharacter = isTakeoverMode && !session.isGroup && (mediaType ? TAKEOVER_MESSAGE_TYPES.includes(mediaType) : false);
 
         const newMsg = pushChatMessage({
             sessionId: session.id,
@@ -4937,10 +4940,26 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         }
     }, [learnTakeoverStyle]);
 
-    const toggleTakeover = useCallback(() => {
-        if (isTakeoverMode) exitTakeover();
-        else enterTakeover();
-    }, [isTakeoverMode, enterTakeover, exitTakeover]);
+    // ── 头像长按切换身份：长按角色头像→接管，长按自己头像→退出接管 ──
+    const avatarLongPressTimerRef = useRef<NodeJS.Timeout | null>(null);
+    const handleAvatarPointerDown = useCallback((e: React.PointerEvent, kind: "character" | "user") => {
+        if (e.pointerType === "mouse" && e.button !== 0) return;
+        e.stopPropagation();
+        e.preventDefault();
+        if (avatarLongPressTimerRef.current) clearTimeout(avatarLongPressTimerRef.current);
+        avatarLongPressTimerRef.current = setTimeout(() => {
+            avatarLongPressTimerRef.current = null;
+            if (kind === "character") enterTakeover();
+            else exitTakeover();
+        }, 500);
+    }, [enterTakeover, exitTakeover]);
+
+    const handleAvatarPointerUp = useCallback(() => {
+        if (avatarLongPressTimerRef.current) {
+            clearTimeout(avatarLongPressTimerRef.current);
+            avatarLongPressTimerRef.current = null;
+        }
+    }, []);
 
     const handleRetractMessage = (msgId: string) => {
         retractChatMessage(msgId);
@@ -5516,14 +5535,6 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     )}
                     {m.role === "assistant" && (
                         <>
-                            {!session.isGroup && (
-                                <button
-                                    onClick={() => { toggleTakeover(); setActiveMessageId(null); }}
-                                    className={`ctx-menu-btn${isTakeoverMode ? " ctx-menu-btn-active" : ""}`}
-                                >
-                                    {isTakeoverMode ? "退出接管" : "接管"}
-                                </button>
-                            )}
                             <button onClick={() => { handleDirectorMode(storedMessageId); setActiveMessageId(null); }} className="ctx-menu-btn">导演模式</button>
                             <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
                         </>
@@ -6872,12 +6883,19 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                             : character;
                                                         return (
                                                             <>
-                                                    <div onDoubleClick={() => {
-                                                        const targetChar = session.isGroup && msg.senderCharacterId
-                                                            ? groupCharMap.get(msg.senderCharacterId) || character
-                                                            : character;
-                                                        if (targetChar) sendRichMessage("poke", { pokeTarget: targetChar.name });
-                                                    }} className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden cursor-pointer">
+                                                    <div
+                                                        onDoubleClick={() => {
+                                                            const targetChar = session.isGroup && msg.senderCharacterId
+                                                                ? groupCharMap.get(msg.senderCharacterId) || character
+                                                                : character;
+                                                            if (targetChar) sendRichMessage("poke", { pokeTarget: targetChar.name });
+                                                        }}
+                                                        onPointerDown={(e) => handleAvatarPointerDown(e, "character")}
+                                                        onPointerUp={handleAvatarPointerUp}
+                                                        onPointerCancel={handleAvatarPointerUp}
+                                                        onPointerLeave={handleAvatarPointerUp}
+                                                        className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden cursor-pointer"
+                                                    >
                                                         {senderChar?.avatar ? (
                                                             <img src={senderChar.avatar} className="w-full h-full object-cover" alt="" />
                                                         ) : (
@@ -6945,6 +6963,24 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                             />
                                         </div>
                                         </div>}
+                                        {msg.role === "user" && !isSilentThought && !isEmptyBubble && (
+                                            <div
+                                                className="chat-msg-avatar flex flex-col items-center gap-1 shrink-0"
+                                                onPointerDown={(e) => handleAvatarPointerDown(e, "user")}
+                                                onPointerUp={handleAvatarPointerUp}
+                                                onPointerCancel={handleAvatarPointerUp}
+                                                onPointerLeave={handleAvatarPointerUp}
+                                                title={isTakeoverMode ? "长按退出接管" : "长按回到自己的身份"}
+                                            >
+                                                <div className="w-[40px] h-[40px] rounded-[20px] bg-[var(--c-input)] overflow-hidden cursor-pointer">
+                                                    {effectiveUserAvatar ? (
+                                                        <img src={effectiveUserAvatar} className="w-full h-full object-cover" alt="" />
+                                                    ) : (
+                                                        <User size={18} color="var(--c-text)" className="m-auto" />
+                                                    )}
+                                                </div>
+                                            </div>
+                                        )}
                                         {msg.role !== "user" && !isSilentThought && !isEmptyBubble && hasFoldedPanel && (
                                             <button
                                                 onClick={(e) => { e.stopPropagation(); setExpandedThinkingId(prev => prev === msg.id ? null : msg.id); }}
