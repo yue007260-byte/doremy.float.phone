@@ -37,7 +37,7 @@ import { CustomAppForegroundBoundary } from "@/components/app-market/custom-app-
 
 import { ChatSettingsPanel } from "./chat-settings-panel";
 import { DirectorModeDialog } from "./director-mode-dialog";
-import { buildDirectorRetryNote, saveDirectorRule } from "@/lib/chat-director";
+import { buildDirectorRetryNote, saveDirectorRule, analyzeTakeoverStyle } from "@/lib/chat-director";
 import type { DirectorDraft } from "@/lib/chat-director";
 // 通话界面不再由聊天室渲染：已提升到 desktop-shell 的 CallLayer，
 // 这样切会话、回桌面、开别的 App 都不会中断通话。聊天室只负责「发起」；
@@ -664,6 +664,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     muteUntilMs: number;
     isGenerating: boolean;
     theaterMode: boolean;
+    takeoverMode: boolean;
     enterToSendEnabled: boolean;
     quotingMessage: ChatMessage | null;
     showEmojiPanel: boolean;
@@ -695,6 +696,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
     muteUntilMs,
     isGenerating,
     theaterMode,
+    takeoverMode,
     enterToSendEnabled,
     quotingMessage,
     showEmojiPanel,
@@ -872,7 +874,7 @@ const ChatTextInputBar = memo(forwardRef<ChatTextInputHandle, {
                 disabled={inputLocked}
                 placeholder={inputLocked
                     ? (isSpectator ? "围观中，你不在这个群里" : `禁言中，剩余${Math.ceil(muteRemainingMs / 60000)}分钟`)
-                    : (theaterMode ? "写下番外指令..." : undefined)}
+                    : (takeoverMode ? `以 ${characterName} 的身份发言...` : (theaterMode ? "写下番外指令..." : undefined))}
             />
 
             <div className="chat-input-actions">
@@ -1413,6 +1415,11 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
     // 导演模式多选：选中后点确认才打开对话框
     const [isDirectorSelectMode, setIsDirectorSelectMode] = useState(false);
     const [directorSelectedIds, setDirectorSelectedIds] = useState<Set<string>>(new Set());
+    // 接管模式：用户以角色身份发言（私聊线上模式），退出后恢复普通模式
+    const [isTakeoverMode, setIsTakeoverMode] = useState(false);
+    // 接管期间以角色身份发出的发言样本（退出时自动分析学习说话方式）
+    const takeoverSamplesRef = useRef<string[]>([]);
+    const takeoverLearningRef = useRef(false);
     const [editingResponseBatchId, setEditingResponseBatchId] = useState<string | null>(null);
     const [editingResponseRoundId, setEditingResponseRoundId] = useState<string | null>(null);
     const [editingResponseContent, setEditingResponseContent] = useState("");
@@ -1988,6 +1995,10 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setIsMultiSelectMode(false);
         setSelectedMessageIds(new Set());
         setShowConfirmMultiDelete(false);
+        setIsDirectorSelectMode(false);
+        setDirectorSelectedIds(new Set());
+        setIsTakeoverMode(false);
+        takeoverSamplesRef.current = [];
         setEditingOfflineTarget(null);
         setEditingOfflineContent("");
         setOfflineTurns(loadChatOfflineTurns(session.id));
@@ -3744,16 +3755,28 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         const walletDebit = debitOutgoingMoneyMessage(mediaType, mediaData);
         if (!walletDebit.ok) return false;
 
+        // 接管模式：语音/表情包/图片等「消息类」富媒体以角色身份落库，不触发角色回复。
+        // 资金类（红包/转账/代付/礼物）与拍一拍属于用户动作，保持用户身份。
+        const TAKEOVER_MESSAGE_TYPES: ChatMessage["mediaType"][] = ["sticker", "audio", "image", "location", "music_share", "xiaohongshu_note_share", "app_card"];
+        const asCharacter = isTakeoverMode && !session.isGroup && (mediaType ? TAKEOVER_MESSAGE_TYPES.includes(mediaType) : false);
+
         const newMsg = pushChatMessage({
             sessionId: session.id,
-            role: "user",
+            role: asCharacter ? "assistant" : "user",
             content,
             mediaType,
             mediaData: walletDebit.mediaData,
             ...(mediaUrl ? { mediaUrl } : {}),
+            ...(asCharacter ? { senderCharacterId: session.contactId, senderName: character?.name } : {}),
         });
         setMessages(prev => [...prev, newMsg]);
-        setPendingGenerate(true);
+        // 接管模式：语音条的文字（label）与图片说明也作为说话方式样本记录
+        if (asCharacter) {
+            const sampleText = (content || mediaData?.label || "").trim();
+            if (sampleText) takeoverSamplesRef.current.push(sampleText);
+        } else {
+            setPendingGenerate(true);
+        }
         return true;
     };
 
@@ -4281,16 +4304,19 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
             const diceOnly = !isQuoting && isDiceOnlyMessage(currentText);
             const diceFace = diceOnly ? rollChatDiceFace() : 0;
 
+            // 接管模式：以角色身份发文字，落库为 assistant，不触发角色回复
+            const asCharacter = isTakeoverMode && !session.isGroup;
             const newMsg = pushChatMessage({
                 sessionId: session.id,
-                role: "user",
+                role: asCharacter ? "assistant" : "user",
                 content: currentText,
                 mediaType: diceOnly ? "dice" : isQuoting ? "quote" : undefined,
                 mediaData: diceOnly ? { diceFace } : isQuoting ? quoteData : undefined,
+                ...(asCharacter ? { senderCharacterId: session.contactId, senderName: character?.name } : {}),
             });
 
             setMessages(prev => [...prev, newMsg]);
-            if (diceOnly) {
+            if (diceOnly && !asCharacter) {
                 const diceAside = pushChatMessage({
                     sessionId: session.id,
                     role: "system",
@@ -4298,10 +4324,15 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                 });
                 setMessages(prev => [...prev, diceAside]);
             }
-            setPendingGenerate(true);
-            // 按回复键发送：消息落库后立即触发模型回复（无论插件是否异步改写，
-            // 都在消息真正写入后触发，避免回复基于旧上下文）
-            if (options?.autoReply) void triggerAIResponse();
+            // 接管模式：记录发言样本用于退出后自动学习；不触发角色回复
+            if (asCharacter) {
+                if (currentText.trim()) takeoverSamplesRef.current.push(currentText.trim());
+            } else {
+                setPendingGenerate(true);
+                // 按回复键发送：消息落库后立即触发模型回复（无论插件是否异步改写，
+                // 都在消息真正写入后触发，避免回复基于旧上下文）
+                if (options?.autoReply) void triggerAIResponse();
+            }
         };
 
         // 聊天插件织入点 user.beforeSend：无插件时走原同步路径，
@@ -4853,6 +4884,63 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
         setDirectorSelectedIds(new Set());
         setDirectorTargets(selected);
     }, [messages, directorSelectedIds, session.id]);
+
+    // ── 接管模式 ──
+    const enterTakeover = useCallback(() => {
+        if (session.isGroup) return;
+        if (isGenerating) {
+            showChatToast("请先等待对方回复");
+            return;
+        }
+        setIsTakeoverMode(true);
+        takeoverSamplesRef.current = [];
+        setShowEmojiPanel(false);
+        setShowStickerPanel(false);
+        setShowPlusMenu(false);
+        setQuotingMessage(null);
+        setPendingGenerate(false);
+    }, [session.isGroup, isGenerating]);
+
+    // 退出接管：把本次接管的发言样本自动分析学习，提炼说话方式并保存为长期规则
+    const learnTakeoverStyle = useCallback(async (samples: string[]) => {
+        if (session.isGroup || !session.contactId) return;
+        if (takeoverLearningRef.current) return;
+        takeoverLearningRef.current = true;
+        try {
+            const result = await analyzeTakeoverStyle({
+                samples,
+                characterName: character?.name || "对方",
+            });
+            if (!result.content) {
+                if (result.error) showChatToast(result.error, 3000);
+                return;
+            }
+            await saveDirectorRule(session.contactId, {
+                example: samples.slice(0, 5).join("\n"),
+                explanation: "用户在接管模式下以角色身份发言，AI 应模仿这种说话方式与风格。",
+                analysis: result.content,
+            });
+            showChatToast("已学习本次接管的说话方式，后续回复会自动模仿", 2800);
+        } catch (e) {
+            showChatToast(`学习失败: ${e instanceof Error ? e.message : String(e)}`, 3000);
+        } finally {
+            takeoverLearningRef.current = false;
+        }
+    }, [session.isGroup, session.contactId, character?.name]);
+
+    const exitTakeover = useCallback(() => {
+        setIsTakeoverMode(false);
+        const samples = takeoverSamplesRef.current;
+        takeoverSamplesRef.current = [];
+        if (samples.length > 0) {
+            void learnTakeoverStyle(samples);
+        }
+    }, [learnTakeoverStyle]);
+
+    const toggleTakeover = useCallback(() => {
+        if (isTakeoverMode) exitTakeover();
+        else enterTakeover();
+    }, [isTakeoverMode, enterTakeover, exitTakeover]);
 
     const handleRetractMessage = (msgId: string) => {
         retractChatMessage(msgId);
@@ -5428,6 +5516,14 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                     )}
                     {m.role === "assistant" && (
                         <>
+                            {!session.isGroup && (
+                                <button
+                                    onClick={() => { toggleTakeover(); setActiveMessageId(null); }}
+                                    className={`ctx-menu-btn${isTakeoverMode ? " ctx-menu-btn-active" : ""}`}
+                                >
+                                    {isTakeoverMode ? "退出接管" : "接管"}
+                                </button>
+                            )}
                             <button onClick={() => { handleDirectorMode(storedMessageId); setActiveMessageId(null); }} className="ctx-menu-btn">导演模式</button>
                             <button onClick={() => handleRetry(storedMessageId)} className="ctx-menu-btn ctx-menu-btn-danger">重试以下</button>
                         </>
@@ -6102,6 +6198,9 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                         {session.isGroup
                             ? `${session.groupName || "群聊"}(${(session.participantIds?.length || 0) + (session.isSpectator ? 0 : 1)})`
                             : (session.alias || character?.name || `User_${session.contactId.slice(-4)}`)}
+                        {isTakeoverMode && !session.isGroup && (
+                            <span className="chat-takeover-badge">接管中</span>
+                        )}
                         {(isGenerating || isOfflineGenerating) && (
                             <span className="chat-typing-indicator">
                                 {offlineMode ? "线下生成中" : "对方正在输入"}<span className="chat-typing-dots"><i/><i/><i/></span>
@@ -7088,6 +7187,7 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
 	                muteUntilMs={session.isGroup && session.groupMutes?.[GROUP_SELF_KEY] ? new Date(session.groupMutes[GROUP_SELF_KEY]).getTime() : 0}
 	                isGenerating={isGenerating}
 	                theaterMode={theaterMode}
+                takeoverMode={isTakeoverMode && !session.isGroup}
 	                enterToSendEnabled={enterToSendEnabled}
 	                quotingMessage={quotingMessage}
                 showEmojiPanel={showEmojiPanel}

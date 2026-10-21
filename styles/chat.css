@@ -7277,3 +7277,22 @@
   background: currentColor;
   animation: chat-stream-cursor-blink 1s steps(2, start) infinite;
 }
+
+/* ── 接管模式 ── */
+.chat-takeover-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  font-weight: 600;
+  vertical-align: 2px;
+  color: #fff;
+  background: var(--c-accent, #4f7cff);
+}
+
+.ctx-menu-btn-active {
+  color: var(--c-accent, #4f7cff) !important;
+  font-weight: 600;
+}

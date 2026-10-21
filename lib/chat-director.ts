@@ -164,6 +164,53 @@ export async function analyzeDirectorExample(opts: {
 }
 
 /**
+ * 调用 LLM 分析接管期间的发言：用户以角色身份说话，AI 提炼出角色的说话方式，
+ * 作为长期规则保存，后续回复自动模仿。
+ */
+export async function analyzeTakeoverStyle(opts: {
+    samples: string[];
+    characterName: string;
+    signal?: AbortSignal;
+}): Promise<{ content?: string; error?: string }> {
+    const apiConfig = resolveAuxiliaryApiConfig("reasoningTranslateApiConfigId");
+    if (!apiConfig) {
+        return { error: "请先在设置 → 绑定配置 → 辅助 API 中设置翻译/分析 API（或设置全局默认 API）" };
+    }
+
+    const sampleSection = opts.samples.map((s, i) => `${i + 1}. ${s}`).join("\n");
+
+    const prompt = [
+        "你是一位角色扮演的导演助手。用户在「接管模式」下替角色发言，下面这些是角色（由用户代打）实际说出来的话。",
+        "请分析这些发言，提炼出这个角色的说话方式与风格，作为长期规则，让 AI 之后扮演这个角色时能模仿一致。",
+        "输出要求：",
+        "- 用简洁的条目式总结（不超过 6 条）",
+        "- 覆盖：语气、用词习惯、句式长短、口头禅、情绪表达方式、标点/表情使用倾向",
+        "- 每条说清楚「角色通常怎么做」，不要复述大段原文",
+        "",
+        `${opts.characterName} 的发言样本：`,
+        sampleSection,
+    ].join("\n");
+
+    const controller = opts.signal ? null : new AbortController();
+    const timer = controller ? setTimeout(() => controller.abort(), 60_000) : null;
+    try {
+        const result = await simpleLLMCall(apiConfig, [
+            { role: "user", content: prompt },
+        ], { temperature: 0.3, signal: opts.signal ?? controller?.signal, label: "接管说话方式学习" });
+
+        if (!result.content?.trim()) {
+            return { error: result.error || "分析失败，请重试" };
+        }
+        return { content: result.content.trim() };
+    } catch (e) {
+        if (controller?.signal.aborted) return { error: "分析超时，请重试" };
+        return { error: e instanceof Error ? e.message : "分析失败，请重试" };
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+/**
  * 构建一次性重生成指令（本次指导，不进入长期记忆）
  * 支持单条或多条消息的导演指导。
  */
