@@ -7009,15 +7009,6 @@ export function ChatRoom({ session, onBack, onDeleted }: ChatRoomProps) {
                                                 </svg>
                                             </span>
                                         )}
-                                        {msg.role === "user" && !isEmptyBubble && (
-                                            <div className="chat-msg-avatar w-[40px] h-[40px] rounded-[20px] bg-[var(--c-page-body-bg)] shrink-0 flex items-center justify-center overflow-hidden">
-                                                {effectiveUserAvatar ? (
-                                                    <img src={effectiveUserAvatar} alt="Me" className="w-full h-full object-cover rounded-[20px]" />
-                                                ) : (
-                                                    <User size={20} color="var(--c-text)" />
-                                                )}
-                                            </div>
-                                        )}
                                     </>
                                 )}
                             </div>
